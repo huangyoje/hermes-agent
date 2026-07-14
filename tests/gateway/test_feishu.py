@@ -1660,8 +1660,20 @@ class TestDedupTTL(unittest.TestCase):
 class TestGroupMentionAtAll(unittest.TestCase):
     """Tests for @_all (Feishu @everyone) group mention routing."""
 
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open", "FEISHU_RESPOND_TO_AT_ALL": "true"}, clear=True)
+    def test_at_all_in_content_accepts_without_explicit_bot_mention(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
 
-    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed"}, clear=True)
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(
+            content='{"text":"@_all 请注意"}',
+            mentions=[],
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(_admits_group(adapter, message, sender_id, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed", "FEISHU_RESPOND_TO_AT_ALL": "true"}, clear=True)
     def test_at_all_still_requires_policy_gate(self):
         """@_all bypasses mention gating but NOT the allowlist policy."""
         from gateway.config import PlatformConfig
