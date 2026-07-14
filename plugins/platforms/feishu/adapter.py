@@ -437,6 +437,7 @@ class FeishuAdapterSettings:
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
     respond_to_at_all: bool = False  # When True, treat @所有人 (@_all) as mentioning the bot
+    group_topic_sessions: bool = False  # When True, each group message without an existing thread creates a new Feishu topic
 
 
 @dataclass
@@ -1664,6 +1665,9 @@ class FeishuAdapter(BasePlatformAdapter):
             ),
             respond_to_at_all=_to_boolean(
                 extra.get("respond_to_at_all", os.getenv("FEISHU_RESPOND_TO_AT_ALL", "false"))
+            ),
+            group_topic_sessions=_to_boolean(
+                extra.get("group_topic_sessions", os.getenv("FEISHU_GROUP_TOPIC_SESSIONS", "false"))
             ),
         )
 
@@ -3352,6 +3356,30 @@ class FeishuAdapter(BasePlatformAdapter):
                 text = f"{hint}\n\n{text}" if text else hint
 
         thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+
+        # group_topic_sessions: isolate each group message into its own Feishu topic session.
+        #
+        # Two cases:
+        #   1. New message (no thread context): use message_id as thread_id so the session key
+        #      is unique per message. The outbound reply will use reply_in_thread=True, which
+        #      causes Feishu to auto-create a topic anchored to this message.
+        #   2. Reply inside an existing topic (thread_id = omt_xxx): use root_id (the topic's
+        #      root message ID) as thread_id so all replies in the same topic share the same
+        #      session as the original message that created it.
+        #      Note: DM (p2p) messages are never affected.
+        _group_topic_active = (
+            chat_type != "p2p"
+            and getattr(getattr(self, "_settings", None), "group_topic_sessions", False)
+        )
+        if _group_topic_active:
+            if not thread_id:
+                # Case 1: new group message — anchor to this message_id
+                thread_id = message_id
+            elif thread_id.startswith("omt_"):
+                # Case 2: reply inside an existing Feishu topic — map back to root message
+                root_id = getattr(message, "root_id", None) or None
+                thread_id = root_id or message_id
+
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)

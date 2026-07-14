@@ -1624,6 +1624,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "send_read_receipts" in platform_cfg:
                     bridged["send_read_receipts"] = platform_cfg["send_read_receipts"]
+                if "group_topic_sessions" in platform_cfg:
+                    bridged["group_topic_sessions"] = platform_cfg["group_topic_sessions"]
                 if plat == Platform.TELEGRAM and "allowed_chats" in platform_cfg:
                     bridged["allowed_chats"] = platform_cfg["allowed_chats"]
                 if plat == Platform.TELEGRAM and "group_allowed_chats" in platform_cfg:
