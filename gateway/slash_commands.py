@@ -2802,6 +2802,10 @@ class GatewaySlashCommandsMixin:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                    reply_to_text=getattr(event, "reply_to_text", None),
+                    media_urls=getattr(event, "media_urls", None) or [],
+                    media_types=getattr(event, "media_types", None) or [],
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
