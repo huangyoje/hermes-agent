@@ -2740,6 +2740,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             elif (
                                 send_raw_response
                                 and thread_id
+                                and isinstance(send_raw_response, dict)
                                 and send_raw_response.get("thread_fallback")
                             ):
                                 requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
