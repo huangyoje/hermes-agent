@@ -1192,6 +1192,250 @@ class TestAdapterBehavior(unittest.TestCase):
 
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_group_message_keeps_group_type_when_chat_lookup_falls_back(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "oc_group", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            message_type="text",
+            content='{"text":"hello group"}',
+            message_id="om_group_text",
+        )
+        sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+        sender = SimpleNamespace(sender_type="user", sender_id=sender_id)
+        data = SimpleNamespace(event=SimpleNamespace(message=message))
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=sender.sender_id,
+                chat_type="group",
+                message_id="om_group_text",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.chat_type, "group")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_fetches_reply_to_text(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_reply_context = AsyncMock(return_value=("父消息内容", [], []))
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"reply"}',
+            message_id="om_reply",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="p2p",
+                message_id="om_reply",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.reply_to_message_id, "om_parent")
+        self.assertEqual(event.reply_to_text, "父消息内容")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_replies_in_thread_when_thread_metadata_present(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _ReplyAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_ReplyAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="hello",
+                    reply_to="om_parent",
+                    metadata={"thread_id": "omt-thread"},
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_reply")
+        self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_metadata_reply_target_for_threaded_feishu_topic(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="status update",
+                    metadata={
+                        "thread_id": "omt-thread",
+                        "reply_to_message_id": "om_trigger",
+                    },
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].message_id, "om_trigger")
+        self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_retries_transient_failure(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"attempts": 0}
+        sleeps = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["attempts"] += 1
+                captured["request"] = request
+                if captured["attempts"] == 1:
+                    raise OSError("temporary send failure")
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_retry"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        async def _sleep(delay):
+            sleeps.append(delay)
+
+        with (
+            patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct),
+            patch("plugins.platforms.feishu.adapter.asyncio.sleep", side_effect=_sleep),
+        ):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="hello retry"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_retry")
+        self.assertEqual(captured["attempts"], 2)
+        self.assertEqual(sleeps, [1])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_does_not_retry_deterministic_api_failure(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"attempts": 0}
+        sleeps = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["attempts"] += 1
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=400,
+                    msg="bad request",
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        async def _sleep(delay):
+            sleeps.append(delay)
+
+        with (
+            patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct),
+            patch("plugins.platforms.feishu.adapter.asyncio.sleep", side_effect=_sleep),
+        ):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="bad payload"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "[400] bad request")
+        self.assertEqual(captured["attempts"], 1)
+        self.assertEqual(sleeps, [])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_document_reply_uses_thread_flag(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -2479,3 +2723,147 @@ class TestChatLockEviction(unittest.TestCase):
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
 
 
+
+    def test_lru_eviction_respects_recent_access(self):
+        adapter = self._make_adapter(max_size=5)
+        for i in range(5):
+            adapter._get_chat_lock(f"c{i}")
+        # Touch c0 so it is no longer the LRU entry, then add a new chat.
+        adapter._get_chat_lock("c0")
+        adapter._get_chat_lock("c_new")
+        self.assertEqual(len(adapter._chat_locks), 5)
+        self.assertNotIn("c1", adapter._chat_locks)  # c1 was the true LRU
+        self.assertIn("c0", adapter._chat_locks)
+        self.assertIn("c_new", adapter._chat_locks)
+
+    def test_eviction_skips_held_locks(self):
+        adapter = self._make_adapter(max_size=3)
+
+        async def _run():
+            held = adapter._get_chat_lock("held")
+            await held.acquire()
+            try:
+                adapter._get_chat_lock("x")
+                adapter._get_chat_lock("y")
+                # At capacity; "held" is LRU but locked, so "x" should go instead.
+                adapter._get_chat_lock("z")
+                self.assertIn("held", adapter._chat_locks)
+                self.assertNotIn("x", adapter._chat_locks)
+                self.assertEqual(len(adapter._chat_locks), 3)
+            finally:
+                held.release()
+
+        asyncio.run(_run())
+
+
+class TestFetchReplyContextSingleLookup(unittest.TestCase):
+    """Verify _fetch_reply_context calls message.get exactly once and returns
+    both text and media from a single API response."""
+
+    def _build_adapter(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter.__new__(FeishuAdapter)
+        adapter._bot_open_id = "ou_bot"
+        adapter._bot_user_id = ""
+        adapter._bot_name = "Hermes"
+        adapter._message_text_cache = OrderedDict()
+        adapter._client = Mock()
+        adapter._sdk_executor_lock = None
+        adapter._sdk_executor = None
+        adapter._sdk_executor_closing = False
+        return adapter
+
+    def test_image_reply_uses_single_message_get(self):
+        """Quoting an image message: one message.get → text + media."""
+        adapter = self._build_adapter()
+
+        parent = SimpleNamespace(
+            msg_type="image",
+            body=SimpleNamespace(content=json.dumps({"image_key": "img_reply_key"})),
+            mentions=None,
+        )
+        response = Mock()
+        response.success = Mock(return_value=True)
+        response.data = SimpleNamespace(items=[parent])
+        adapter._client.im.v1.message.get = Mock(return_value=response)
+
+        # Mock the resource download (separate API, expected)
+        adapter._download_feishu_message_resources = AsyncMock(
+            return_value=(["/tmp/reply.jpg"], ["image/jpeg"])
+        )
+
+        text, media_urls, media_types = asyncio.run(
+            adapter._fetch_reply_context("om_parent_img")
+        )
+
+        # Core assertion: parent message lookup only once
+        self.assertEqual(adapter._client.im.v1.message.get.call_count, 1)
+        # Text for an image message is typically None or placeholder
+        # Media is correctly extracted
+        self.assertEqual(media_urls, ["/tmp/reply.jpg"])
+        self.assertEqual(media_types, ["image/jpeg"])
+
+    def test_plain_text_reply_uses_single_message_get_no_media(self):
+        """Quoting a text message: one message.get → text only, no media download."""
+        adapter = self._build_adapter()
+
+        parent = SimpleNamespace(
+            msg_type="text",
+            body=SimpleNamespace(content=json.dumps({"text": "quoted content"})),
+            mentions=None,
+        )
+        response = Mock()
+        response.success = Mock(return_value=True)
+        response.data = SimpleNamespace(items=[parent])
+        adapter._client.im.v1.message.get = Mock(return_value=response)
+
+        text, media_urls, media_types = asyncio.run(
+            adapter._fetch_reply_context("om_parent_txt")
+        )
+
+        self.assertEqual(adapter._client.im.v1.message.get.call_count, 1)
+        self.assertEqual(text, "quoted content")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+
+    def test_text_cached_after_fetch_reply_context(self):
+        """_fetch_reply_context populates the text cache for future lookups."""
+        adapter = self._build_adapter()
+
+        parent = SimpleNamespace(
+            msg_type="text",
+            body=SimpleNamespace(content=json.dumps({"text": "cached text"})),
+            mentions=None,
+        )
+        response = Mock()
+        response.success = Mock(return_value=True)
+        response.data = SimpleNamespace(items=[parent])
+        adapter._client.im.v1.message.get = Mock(return_value=response)
+
+        asyncio.run(adapter._fetch_reply_context("om_cached"))
+
+        # Subsequent _fetch_message_text should use cache, no additional API call
+        adapter._client.im.v1.message.get.reset_mock()
+        result = asyncio.run(adapter._fetch_message_text("om_cached"))
+
+        self.assertEqual(result, "cached text")
+        adapter._client.im.v1.message.get.assert_not_called()
+
+    def test_failed_lookup_returns_none_and_empty_media(self):
+        """API failure gracefully returns (None, [], [])."""
+        adapter = self._build_adapter()
+
+        response = Mock()
+        response.success = Mock(return_value=False)
+        response.code = 99999
+        response.msg = "not found"
+        adapter._client.im.v1.message.get = Mock(return_value=response)
+
+        text, media_urls, media_types = asyncio.run(
+            adapter._fetch_reply_context("om_missing")
+        )
+
+        self.assertIsNone(text)
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
