@@ -3373,7 +3373,16 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # In DM, only real Feishu topics (omt_ prefix) should split sessions.
+        # A quote-reply in DM sets root_id to the quoted message's ID, but that
+        # is NOT a thread — it's just a pointer. Using it as thread_id would
+        # split the DM into separate sessions on every quote-reply.
+        raw_thread = getattr(message, "thread_id", None) or None
+        raw_root = getattr(message, "root_id", None) or None
+        if chat_type == "p2p":
+            thread_id = raw_thread if raw_thread and str(raw_thread).startswith("omt_") else None
+        else:
+            thread_id = raw_thread or raw_root or None
 
         # group_topic_sessions: isolate each group message into its own Feishu topic session.
         #
