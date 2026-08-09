@@ -2867,3 +2867,84 @@ class TestFetchReplyContextSingleLookup(unittest.TestCase):
         self.assertIsNone(text)
         self.assertEqual(media_urls, [])
         self.assertEqual(media_types, [])
+
+    def test_merge_forward_reply_extracts_text_and_media(self):
+        """Quoting a merge_forward: aggregates sub-message text + downloads images."""
+        adapter = self._build_adapter()
+        adapter._sender_name_cache = OrderedDict()
+
+        parent = SimpleNamespace(
+            message_id="om_parent_fwd",
+            msg_type="merge_forward",
+            body=SimpleNamespace(content=json.dumps({"title": "Chat History"})),
+            mentions=None,
+        )
+        sub_text = SimpleNamespace(
+            message_id="om_sub_text",
+            msg_type="text",
+            body=SimpleNamespace(content=json.dumps({"text": "hello from sub"})),
+            mentions=None,
+            sender=SimpleNamespace(id="ou_alice", id_type="open_id"),
+        )
+        sub_image = SimpleNamespace(
+            message_id="om_sub_img",
+            msg_type="image",
+            body=SimpleNamespace(content=json.dumps({"image_key": "img_fwd_001"})),
+            mentions=None,
+            sender=SimpleNamespace(id="ou_bob", id_type="open_id"),
+        )
+        response = Mock()
+        response.success = Mock(return_value=True)
+        response.data = SimpleNamespace(items=[parent, sub_text, sub_image])
+        adapter._client.im.v1.message.get = Mock(return_value=response)
+
+        adapter._download_feishu_image = AsyncMock(
+            return_value=("/tmp/fwd_img.jpg", "image/jpeg")
+        )
+        adapter._resolve_sender_name_from_api = AsyncMock()
+        adapter._get_cached_sender_name = Mock(return_value="Alice")
+
+        text, media_urls, media_types = asyncio.run(
+            adapter._fetch_reply_context("om_parent_fwd")
+        )
+
+        self.assertEqual(adapter._client.im.v1.message.get.call_count, 1)
+        self.assertIn("hello from sub", text)
+        self.assertEqual(media_urls, ["/tmp/fwd_img.jpg"])
+        self.assertEqual(media_types, ["image/jpeg"])
+
+    def test_merge_forward_media_fallback_to_parent_id(self):
+        """Image download tries sub-message ID first, falls back to parent ID."""
+        adapter = self._build_adapter()
+
+        parent = SimpleNamespace(
+            message_id="om_parent_fwd",
+            msg_type="merge_forward",
+            body=SimpleNamespace(content=json.dumps({})),
+            mentions=None,
+        )
+        sub_image = SimpleNamespace(
+            message_id="om_sub_img",
+            msg_type="image",
+            body=SimpleNamespace(content=json.dumps({"image_key": "img_key_1"})),
+            mentions=None,
+            sender=SimpleNamespace(id="ou_user", id_type="open_id"),
+        )
+
+        call_count = {"n": 0}
+
+        async def mock_download(*, message_id, image_key):
+            call_count["n"] += 1
+            if message_id == "om_sub_img":
+                return (None, "")  # sub-message ID fails (234003 in real life)
+            return ("/tmp/img.jpg", "image/jpeg")  # parent ID succeeds
+
+        adapter._download_feishu_image = mock_download
+
+        media_urls, media_types = asyncio.run(
+            adapter._extract_merge_forward_media([parent, sub_image])
+        )
+
+        self.assertEqual(call_count["n"], 2)  # tried sub first, then parent
+        self.assertEqual(media_urls, ["/tmp/img.jpg"])
+        self.assertEqual(media_types, ["image/jpeg"])

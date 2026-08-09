@@ -3340,6 +3340,24 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> None:
         text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
 
+        # merge_forward as current message: the websocket event payload only
+        # contains a title/summary placeholder — the real sub-messages must be
+        # fetched via the API. Fetch items once, then extract both text and
+        # media from the same response.
+        raw_type = (getattr(message, "message_type", "") or "").strip().lower()
+        if raw_type == "merge_forward" and message_id and self._client:
+            items = await self._fetch_message_items(message_id)
+            if items:
+                full_text = await self._extract_message_text_from_items(message_id, items)
+                if full_text:
+                    text = full_text
+                fwd_media_urls, fwd_media_types = await self._extract_merge_forward_media(items)
+                if fwd_media_urls:
+                    media_urls.extend(fwd_media_urls)
+                    media_types.extend(fwd_media_types)
+                    if inbound_type == MessageType.TEXT:
+                        inbound_type = MessageType.PHOTO
+
         if inbound_type == MessageType.TEXT:
             text = _strip_edge_self_mentions(text, mentions)
             if text.startswith("/"):
@@ -4371,6 +4389,13 @@ class FeishuAdapter(BasePlatformAdapter):
         raw_content = getattr(body, "content", "") or ""
         parent_mentions = getattr(parent, "mentions", None)
 
+        # merge_forward parent body is the placeholder string "Merged and
+        # Forwarded Message". The real sub-messages live in items[1:] with
+        # an upper_message_id pointing back to the parent. Aggregate their
+        # textual content so the agent can see what was forwarded.
+        if msg_type == "merge_forward":
+            return await self._extract_merge_forward_text(message_id, items)
+
         return self._extract_text_from_raw_content(
             msg_type=msg_type,
             raw_content=raw_content,
@@ -4397,6 +4422,9 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type = (getattr(parent, "msg_type", "") or "").strip().lower()
             body = getattr(parent, "body", None)
             raw_content = getattr(body, "content", "") or ""
+
+            if msg_type == "merge_forward":
+                return await self._extract_merge_forward_media(items)
 
             # Only process media-bearing message types
             if msg_type not in {"image", "post", "sticker", "file", "media"}:
@@ -4463,6 +4491,118 @@ class FeishuAdapter(BasePlatformAdapter):
             message_id, items
         )
         return text, media_urls, media_types
+
+    # =========================================================================
+    # Merge-forward sub-message aggregation
+    # =========================================================================
+
+    async def _extract_merge_forward_media(
+        self,
+        items: Sequence[Any],
+    ) -> tuple[List[str], List[str]]:
+        """Extract images from merge_forward sub-messages.
+
+        Feishu's image resource API requires a message_id that "owns" the file.
+        For merge_forward, ownership is ambiguous — try the sub-message's own
+        message_id first, then fall back to the parent merge_forward ID.
+        """
+        parent_message_id = getattr(items[0], "message_id", "") or "" if items else ""
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        max_images = 10
+        for it in items[1:]:
+            if len(media_urls) >= max_images:
+                break
+            sub_type = (getattr(it, "msg_type", "") or "").strip().lower()
+            if sub_type not in ("image", "post"):
+                continue
+            sub_message_id = getattr(it, "message_id", "") or ""
+            body = getattr(it, "body", None)
+            sub_raw = getattr(body, "content", "") or ""
+            normalized = normalize_feishu_message(
+                message_type=sub_type,
+                raw_content=sub_raw,
+                mentions=getattr(it, "mentions", None),
+                bot=self._bot_identity(),
+            )
+            for image_key in normalized.image_keys:
+                if len(media_urls) >= max_images:
+                    break
+                # Try sub-message ID first, fall back to parent merge_forward ID
+                cached_path = None
+                for mid in (sub_message_id, parent_message_id):
+                    if not mid:
+                        continue
+                    cached_path, media_type = await self._download_feishu_image(
+                        message_id=mid,
+                        image_key=image_key,
+                    )
+                    if cached_path:
+                        break
+                if cached_path:
+                    media_urls.append(cached_path)
+                    media_types.append(media_type)
+        return media_urls, media_types
+
+    async def _extract_merge_forward_text(
+        self,
+        parent_id: str,
+        items: Sequence[Any],
+    ) -> Optional[str]:
+        """Aggregate sub-messages of a merge_forward into a single text blob.
+
+        items[0] is the merge_forward placeholder. items[1:] are the
+        sub-messages — each carries its own msg_type/body/sender/mentions and
+        an upper_message_id that points back to parent_id (directly, or via a
+        nested merge_forward). Lines are formatted as ``<sender>: <text>`` so
+        the agent sees who sent what.
+        """
+        sub_items = [it for it in items[1:] if it is not None]
+        if not sub_items:
+            return FALLBACK_FORWARD_TEXT
+
+        # Resolve sender display names in one go (one batch API call max).
+        sender_open_ids: List[str] = []
+        for it in sub_items:
+            sender = getattr(it, "sender", None)
+            sid = getattr(sender, "id", None) or ""
+            sid_type = getattr(sender, "id_type", None) or ""
+            if sid and sid_type == "open_id" and sid not in sender_open_ids:
+                sender_open_ids.append(sid)
+        for oid in sender_open_ids:
+            try:
+                await self._resolve_sender_name_from_api(oid, is_bot=False)
+            except Exception:
+                logger.debug("[Feishu] Failed to resolve sender name %s for merge_forward", oid, exc_info=True)
+
+        lines: List[str] = []
+        for it in sub_items:
+            body = getattr(it, "body", None)
+            sub_type = getattr(it, "msg_type", "") or ""
+            sub_raw = getattr(body, "content", "") or ""
+            sub_mentions = getattr(it, "mentions", None)
+            sub_text = self._extract_text_from_raw_content(
+                msg_type=sub_type,
+                raw_content=sub_raw,
+                mentions=sub_mentions,
+            )
+            if not sub_text:
+                if sub_type in ("image", "sticker"):
+                    sub_text = "[Image]"
+                else:
+                    continue
+            sender = getattr(it, "sender", None)
+            sid = getattr(sender, "id", None) or ""
+            display = self._get_cached_sender_name(sid) or "unknown"
+            lines.append(f"{display}: {sub_text}")
+
+        if not lines:
+            return FALLBACK_FORWARD_TEXT
+        # Cap to avoid blowing context with a 100-message forward.
+        max_lines = 50
+        if len(lines) > max_lines:
+            lines = lines[:max_lines] + [f"... ({len(sub_items) - max_lines} more sub-messages truncated)"]
+        return "[Merged forward, {} messages]\n".format(len(sub_items)) + "\n".join(lines)
 
     def _extract_text_from_raw_content(
         self,
